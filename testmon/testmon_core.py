@@ -1,3 +1,4 @@
+import glob
 import hashlib
 import os
 import random
@@ -8,7 +9,6 @@ from functools import lru_cache
 from collections import defaultdict
 from xmlrpc.client import Fault, ProtocolError, ServerProxy
 from socket import gaierror
-
 from typing import TypeVar
 
 try:
@@ -26,6 +26,19 @@ from testmon.common import (
     get_system_packages,
     drop_patch_version,
     git_current_head,
+)
+
+from testmon.subprocess_support import (
+    ALWAYS_RUN_SENTINEL,
+    install_sitecustomize,
+    is_read_open,
+    is_trackable_argv_path,
+    is_trackable_data_path,
+    looks_like_python_executable,
+    prepend_pythonpath,
+    project_relpath,
+    read_sidecars,
+    restore_pythonpath,
 )
 
 from testmon.process_code import (
@@ -311,7 +324,19 @@ class TestmonData:  # pylint: disable=too-many-instance-attributes
             deps_n_outcomes: DepsNOutcomes = {"deps": []}
 
             for filename, covered in nodes_files_lines[context].items():
-                if os.path.exists(os.path.join(self.rootdir, filename)):
+                if filename == ALWAYS_RUN_SENTINEL:
+                    # Never on disk: `TestmonData.determine_stable` always treats
+                    # it as changed, so the test it is attached to is always
+                    # selected. See `TestmonCollector._merge_extra_dependencies`.
+                    deps_n_outcomes["deps"].append(
+                        {
+                            "filename": ALWAYS_RUN_SENTINEL,
+                            "mtime": None,
+                            "fsha": "always-run",
+                            "method_checksums": [],
+                        }
+                    )
+                elif os.path.exists(os.path.join(self.rootdir, filename)):
                     module = self.source_tree.get_file(filename)
                     fingerprint = create_fingerprint(module, covered)
                     deps_n_outcomes["deps"].append(
@@ -465,6 +490,8 @@ def force_context_capable_core(cov: Coverage):
 
 class TestmonCollector:
     coverage_stack: [Coverage] = []
+    cov_owners: dict = {}
+    _audit_hook_installed = False
 
     def __init__(
         self, rootdir, testmon_labels=None, cov_plugin=None
@@ -483,6 +510,9 @@ class TestmonCollector:
         self.testmon_labels = testmon_labels
         self.cov: Coverage = None
         self.sub_cov_file = None
+        self.tmontmp_dir = None
+        self._subprocess_includes = None
+        self._prev_pythonpath = None
         self.cov_plugin: CovPlugin = cov_plugin
         self._test_name = None
         self._next_test_name = None
@@ -490,6 +520,80 @@ class TestmonCollector:
         self.check_stack = []
         self.is_started = False
         self._interrupted_at = None
+        # Dependencies this process observed that coverage.py's line tracer does
+        # not record: data files opened for reading (`record_opened_file`), and
+        # files named on a non-Python child's command line (`record_subprocess`).
+        # Keyed by test name, merged into `nodes_files_lines` at the next batch
+        # flush; see `_merge_extra_dependencies`.
+        self.file_deps: dict = {}
+        # Tests whose dependencies this process could not fully record: a child
+        # process that is not Python with no project file on its command line, or
+        # a Python child whose report did not arrive by the next flush. See
+        # `ALWAYS_RUN_SENTINEL`.
+        self.always_run: set = set()
+        # test name -> count of Python child processes `record_subprocess` saw
+        # started for that test, so `_merge_extra_dependencies` can tell whether
+        # every child reported back.
+        self._expected_python_children: dict = {}
+        TestmonCollector._ensure_audit_hook()
+
+    @classmethod
+    def _ensure_audit_hook(cls):
+        if cls._audit_hook_installed:
+            return
+        sys.addaudithook(_testmon_audit_hook)
+        cls._audit_hook_installed = True
+
+    def record_opened_file(self, path, mode, flags):
+        """Record a data file this process opened for reading, for the running test."""
+        if self._test_name is None:
+            return
+        if not isinstance(path, (str, bytes, os.PathLike)):
+            return  # a bare file descriptor carries no filename
+        if not is_read_open(mode, flags):
+            return
+        relpath = project_relpath(os.path.abspath(os.fspath(path)), self.rootdir)
+        if relpath is None or not is_trackable_data_path(relpath):
+            return
+        self.file_deps.setdefault(self._test_name, set()).add(relpath)
+
+    def record_subprocess(self, executable, args, cwd):
+        """Record a child process the running test started.
+
+        A Python child's dependencies arrive later, through its own coverage data
+        file and sidecar report; see `_merge_extra_dependencies`. A non-Python
+        child's command line is inspected directly: each argument naming an
+        existing project file becomes a dependency. A child that names no
+        project file, and a Python child whose report never arrives, mark the
+        test always-run.
+        """
+        if self._test_name is None:
+            return
+        test_name = self._test_name
+        argv = [
+            os.fspath(arg)
+            for arg in (args or [])
+            if isinstance(arg, (str, bytes, os.PathLike))
+        ]
+        argv0 = argv[0] if argv else None
+        if looks_like_python_executable(executable, argv0):
+            self._expected_python_children[test_name] = (
+                self._expected_python_children.get(test_name, 0) + 1
+            )
+            return
+        base_dir = cwd if isinstance(cwd, (str, bytes, os.PathLike)) else self.rootdir
+        found_file = False
+        for arg in argv:
+            candidate = arg if os.path.isabs(arg) else os.path.join(base_dir, arg)
+            if not os.path.isfile(candidate):
+                continue
+            relpath = project_relpath(os.path.abspath(candidate), self.rootdir)
+            if relpath is None or not is_trackable_argv_path(relpath):
+                continue
+            self.file_deps.setdefault(test_name, set()).add(relpath)
+            found_file = True
+        if not found_file:
+            self.always_run.add(test_name)
 
     def start_cov(self):
         if not self.cov._started:
@@ -547,6 +651,7 @@ class TestmonCollector:
         self.cov = Coverage(data_file=self.sub_cov_file, config_file=False, **params)
         self.cov._warn_no_data = False
         force_context_capable_core(self.cov)
+        TestmonCollector.cov_owners[id(self.cov)] = self
         if TestmonCollector.coverage_stack:
             TestmonCollector.coverage_stack[-1].stop()
 
@@ -557,11 +662,14 @@ class TestmonCollector:
 
         self.batched_test_names.add(test_name)
         if self.cov is None:
-            self.setup_coverage()
+            self.setup_coverage(subprocess=True)
 
         self.start_cov()
         self._test_name = test_name
         self.cov.switch_context(test_name)
+        if self.sub_cov_file:
+            self._write_subprocess_rc(test_name)
+            os.environ["TESTMON_SUBPROCESS_CONTEXT"] = test_name
         self.check_stack = TestmonCollector.coverage_stack.copy()
 
     def discard_current(self):
@@ -586,9 +694,11 @@ class TestmonCollector:
             or self._interrupted_at
         ):
             self.cov.stop()
+            self._combine_subprocess_coverage()
             nodes_files_lines, lines_data = self.get_nodes_files_lines(
                 dont_include=self._interrupted_at
             )
+            self._merge_extra_dependencies(nodes_files_lines)
 
             if (
                 len(TestmonCollector.coverage_stack) > 1
@@ -607,6 +717,66 @@ class TestmonCollector:
             self.cov.start()
             self.batched_test_names = set()
         return nodes_files_lines
+
+    def _combine_subprocess_coverage(self):
+        """Merge a Python child's own executed-code data into this batch's data.
+
+        Relies on coverage's own subprocess support: a child started with
+        `COVERAGE_PROCESS_START` set writes a parallel data file next to
+        `self.sub_cov_file`, already carrying the running test as its context
+        (see `_write_subprocess_rc`). `Coverage.combine` merges it in and
+        deletes it.
+        """
+        if not self.sub_cov_file:
+            return
+        child_files = [
+            path
+            for path in glob.glob(self.sub_cov_file + ".*")
+            if not path.endswith("_rc")
+        ]
+        if not child_files:
+            return
+        self.cov.combine(data_paths=child_files, strict=False, keep=False)
+
+    def _merge_extra_dependencies(self, nodes_files_lines):
+        """Fold data-file and subprocess dependencies into this batch's fingerprints.
+
+        `nodes_files_lines` already has one entry per batched test (see
+        `get_nodes_files_lines`); a data-file dependency is added to it the same
+        way a covered Python line is: as a filename with an arbitrary covered-line
+        marker, which `TestmonData.get_tests_fingerprints` fingerprints by whole
+        file content for any non-Python file. A sidecar a Python child wrote (see
+        `testmon.subprocess_support.SITECUSTOMIZE_SOURCE`) is read, deleted, and
+        merged the same way, into the test named by its own `context` field. A
+        test whose expected child reports did not all arrive is added to
+        `always_run`.
+        """
+        arrived = {}
+        if self.tmontmp_dir:
+            for context, files in read_sidecars(self.tmontmp_dir):
+                if not context:
+                    continue
+                arrived[context] = arrived.get(context, 0) + 1
+                if files:
+                    self.file_deps.setdefault(context, set()).update(files)
+
+        for test_name, count in self._expected_python_children.items():
+            if arrived.get(test_name, 0) < count:
+                self.always_run.add(test_name)
+        self._expected_python_children = {}
+
+        for test_name, relpaths in self.file_deps.items():
+            if test_name not in nodes_files_lines:
+                continue
+            for relpath in relpaths:
+                nodes_files_lines[test_name].setdefault(relpath, {1})
+        self.file_deps = {}
+
+        for test_name in self.always_run:
+            if test_name not in nodes_files_lines:
+                continue
+            nodes_files_lines[test_name][ALWAYS_RUN_SENTINEL] = {1}
+        self.always_run = set()
 
     def get_nodes_files_lines(self, dont_include):
         cov_data: CoverageData = self.cov.get_data()
@@ -643,36 +813,96 @@ class TestmonCollector:
         if self.cov._started:
             self.cov.stop()
             TestmonCollector.coverage_stack.pop()
+        TestmonCollector.cov_owners.pop(id(self.cov), None)
         if self.sub_cov_file:
             os.remove(self.sub_cov_file + "_rc")
             os.environ.pop("COVERAGE_CORE", None)
+            os.environ.pop("TESTMON_SUBPROCESS_ROOT", None)
+            os.environ.pop("TESTMON_SUBPROCESS_DIR", None)
+            os.environ.pop("TESTMON_SUBPROCESS_CONTEXT", None)
+            restore_pythonpath(self._prev_pythonpath)
         os.environ.pop("COVERAGE_PROCESS_START", None)
         self.cov = None
         if TestmonCollector.coverage_stack:
             TestmonCollector.coverage_stack[-1].start()
 
     def setup_subprocess(self, includes):
-        # This can be redone to use functionality from pytest-cov
-        if not os.path.exists(".tmontmp"):
-            os.makedirs(".tmontmp")
-        self.sub_cov_file = os.path.abspath(
-            ".tmontmp/.testmoncoverage" + str(random.randint(0, 1000000))
+        # Gives a Python child process testmon's own file-open tracking (through a
+        # `sitecustomize.py` on its `PYTHONPATH`) and its executed-code coverage
+        # (through coverage's own `COVERAGE_PROCESS_START` subprocess support,
+        # pinned to the running test's name as a static context). See
+        # `testmon.subprocess_support`.
+        self.tmontmp_dir = os.path.abspath(os.path.join(self.rootdir, ".tmontmp"))
+        os.makedirs(self.tmontmp_dir, exist_ok=True)
+        self.sub_cov_file = os.path.join(
+            self.tmontmp_dir, ".testmoncoverage" + str(random.randint(0, 1000000))
         )
-        with open(self.sub_cov_file + "_rc", "w", encoding="utf-8") as subprocess_rc:
-            rc_content = textwrap.dedent(
-                """\
-                    [run]
-                    data_file = {}
-                    include = {}
-                    parallel=True
-                    """
-            ).format(
-                self.sub_cov_file,
-                "\n ".join(includes),
-            )
-            subprocess_rc.write(rc_content)
+        self._subprocess_includes = includes
+        self._write_subprocess_rc("")
         os.environ["COVERAGE_PROCESS_START"] = self.sub_cov_file + "_rc"
         os.environ["COVERAGE_CORE"] = COVERAGE_CORE
+        os.environ["TESTMON_SUBPROCESS_ROOT"] = self.rootdir
+        os.environ["TESTMON_SUBPROCESS_DIR"] = self.tmontmp_dir
+        install_sitecustomize(self.tmontmp_dir)
+        self._prev_pythonpath = prepend_pythonpath(self.tmontmp_dir)
+
+    def _write_subprocess_rc(self, context):
+        rc_content = textwrap.dedent(
+            """\
+                [run]
+                data_file = {}
+                include = {}
+                parallel=True
+                context = {}
+                """
+        ).format(
+            self.sub_cov_file,
+            "\n ".join(self._subprocess_includes),
+            context,
+        )
+        with open(self.sub_cov_file + "_rc", "w", encoding="utf-8") as subprocess_rc:
+            subprocess_rc.write(rc_content)
+
+
+def _active_collector():
+    if not TestmonCollector.coverage_stack:
+        return None
+    cov = TestmonCollector.coverage_stack[-1]
+    return TestmonCollector.cov_owners.get(id(cov))
+
+
+_audit_hook_warned = False
+
+
+def _testmon_audit_hook(event, args):
+    """Route one `sys.audit` event to the collector running the current test.
+
+    `sys.audit` fires this for every `open()` and `subprocess.Popen()` call in the
+    process, so a bug here must never raise: that would turn an unrelated, correct
+    `open()` call elsewhere in the process into a failure. A problem is logged once
+    and the event is dropped; the dropped test still has `determine_stable`'s
+    existing "no record runs" rule and, for a missed child-process dependency, the
+    always-run fallback in `TestmonCollector.record_subprocess`.
+    """
+    global _audit_hook_warned
+    try:
+        collector = _active_collector()
+        if collector is None:
+            return
+        if event == "open":
+            collector.record_opened_file(*args)
+        elif event == "subprocess.Popen":
+            executable, popen_args, cwd, _env = args
+            collector.record_subprocess(executable, popen_args, cwd)
+    except Exception:  # pylint: disable=broad-except
+        if not _audit_hook_warned:
+            _audit_hook_warned = True
+            logger.warning(
+                "testmon dependency tracking failed for a %r event; "
+                "this and later events may go unrecorded for this run",
+                event,
+                exc_info=True,
+            )
 
 
 def eval_environment(environment, **kwargs):
