@@ -26,6 +26,8 @@ import os
 import random
 import re
 import sys
+from functools import lru_cache
+from subprocess import CalledProcessError, run
 
 # A dependency filename that never exists on disk. A test with this dependency is
 # always selected; see the module docstring and
@@ -64,7 +66,41 @@ def _is_excluded(relpath):
     return any(part.startswith(".") or part in _EXCLUDED_DIR_NAMES for part in parts)
 
 
-def is_trackable_data_path(relpath):
+@lru_cache()
+def _git_ls_files(abs_rootdir):
+    try:
+        result = run(
+            ["git", "ls-files"],
+            cwd=abs_rootdir,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            check=True,
+        )
+    except (FileNotFoundError, NotADirectoryError, CalledProcessError):
+        return None
+    return frozenset(result.stdout.splitlines())
+
+
+def get_git_tracked_files(rootdir):
+    """All relpaths git tracks in `rootdir`'s repository, or `None` if `rootdir`
+    is not inside a git repository (or `git` is unavailable).
+
+    `None` disables the git-tracked restriction in `is_trackable_data_path` and
+    `is_trackable_argv_path` rather than treating every data-file dependency as
+    untracked: a project with no git repository has no tracked-file source of
+    truth to defer to, so it keeps the old, path-shape-only rule.
+
+    Cached on the resolved absolute path, never the raw `rootdir` string: an
+    empty `rootdir` means "the current directory" (`TestmonData.for_local_run`
+    passes it this way throughout the test suite), and the current directory
+    changes between callers. Caching on the literal empty string would pin the
+    very first caller's result for every later one.
+    """
+    return _git_ls_files(os.path.abspath(rootdir))
+
+
+def is_trackable_data_path(relpath, rootdir):
     """True if a change to `relpath` under the project root should select a test.
 
     `relpath` is already relative to the project root, with forward slashes. The
@@ -72,20 +108,40 @@ def is_trackable_data_path(relpath):
     and cache directories, and any dotted path segment. Excluding dotted segments
     also excludes testmon's own `.testmondata` file and `.tmontmp` scratch
     directory, so a test never depends on testmon's own bookkeeping.
+
+    A change to the file only selects a test when the file is tracked by git in
+    `rootdir` -- the same source of truth testmon's Python-file fingerprinting
+    already trusts (`process_code.get_source_sha` reads git's own blob sha for a
+    tracked, unmodified file). A scratch or temp file a test writes inside the
+    project directory, and never commits, is regenerated test run to test run
+    with no real source change behind it; counting it as a dependency reselects
+    the test on every run even when nothing in the project changed.
     """
     if _is_excluded(relpath):
         return False
-    return not relpath.endswith(_CODE_SUFFIXES)
+    if relpath.endswith(_CODE_SUFFIXES):
+        return False
+    tracked = get_git_tracked_files(rootdir)
+    if tracked is None:
+        return True
+    return relpath in tracked
 
 
-def is_trackable_argv_path(relpath):
+def is_trackable_argv_path(relpath, rootdir):
     """True if a change to `relpath` named on a child's command line should select a test.
 
     Unlike `is_trackable_data_path`, a `.py` file named on a command line is not a
     file the parent process executed, so it stays in: the parent process has no
-    other way to know the child depends on it.
+    other way to know the child depends on it. The git-tracked restriction
+    (see `is_trackable_data_path`) still applies: an untracked file named on a
+    command line is as unreliable a dependency signal as one read directly.
     """
-    return not _is_excluded(relpath)
+    if _is_excluded(relpath):
+        return False
+    tracked = get_git_tracked_files(rootdir)
+    if tracked is None:
+        return True
+    return relpath in tracked
 
 
 def project_relpath(abspath, rootdir):
@@ -98,6 +154,39 @@ def project_relpath(abspath, rootdir):
     if relpath.startswith("../") or relpath == "..":
         return None
     return relpath
+
+
+def subprocess_child_touches_rootdir(cwd, argv, rootdir):
+    """False only when there is positive evidence that a child process's
+    working directory and every argument stay outside `rootdir`.
+
+    A child with that evidence cannot depend on project source, Python or not,
+    so `TestmonCollector.record_subprocess` records no dependency for it
+    instead of marking its test always-run (`ALWAYS_RUN_SENTINEL`) -- the
+    common shape of a test fixture that clones a git template, or runs a
+    pinned interpreter, entirely under a scratch directory outside the
+    project. A command with no path-shaped evidence either way (a bare
+    `echo hello`, started with no explicit `cwd`) stays conservative and
+    counts as touching the project: testmon genuinely does not know what it
+    read.
+
+    `argv` already excludes the executable itself; see `record_subprocess`.
+    """
+    explicit_cwd = cwd if isinstance(cwd, (str, bytes, os.PathLike)) else None
+    outside_evidence = False
+    if explicit_cwd is not None:
+        abscwd = os.path.abspath(os.fspath(explicit_cwd))
+        if os.path.isdir(abscwd):
+            if project_relpath(abscwd, rootdir) is not None:
+                return True
+            outside_evidence = True
+    for arg in argv:
+        if not os.path.isabs(arg) or not os.path.exists(arg):
+            continue
+        if project_relpath(arg, rootdir) is not None:
+            return True
+        outside_evidence = True
+    return not outside_evidence
 
 
 def is_read_open(mode, flags):
@@ -244,7 +333,7 @@ if _ROOT and _DEPS_DIR:
             if not is_read_open(mode, flags):
                 return
             relpath = project_relpath(os.path.abspath(os.fspath(path)), _ROOT)
-            if relpath is None or not is_trackable_data_path(relpath):
+            if relpath is None or not is_trackable_data_path(relpath, _ROOT):
                 return
             _opened.add(relpath)
 

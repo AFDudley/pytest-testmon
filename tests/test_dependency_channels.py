@@ -13,6 +13,13 @@ See testmon/subprocess_support.py for the design. Each test covers one channel:
 - test_binary_data_file_dependency_fingerprints_by_raw_bytes: a data file
   with binary (non-UTF-8-decodable) content. testmon.process_code fingerprints
   it from its raw bytes, never through tokenize/source_encoding.
+- test_untracked_scratch_file_dependency_does_not_reselect_test: a data file
+  inside the project directory but never committed to git -- the shape of a
+  scratch/temp file a test regenerates with new content on every run
+  (testmon.subprocess_support.is_trackable_data_path's git-tracked rule).
+- test_subprocess_entirely_outside_rootdir_does_not_force_rerun: a child
+  process whose cwd and every argument stay outside the project directory
+  (testmon.subprocess_support.subprocess_child_touches_rootdir).
 
 Every test runs `--testmon` once to build the dependency database, changes
 something on disk (or nothing, for the always-run case), then calls
@@ -195,3 +202,70 @@ def test_binary_data_file_dependency_fingerprints_by_raw_bytes(testdir):
     with CoreTestmonData.for_local_run("") as td:
         td.determine_stable()
         assert "test_a.py::test_reads_gzip" in td.unstable_test_names
+
+
+def test_untracked_scratch_file_dependency_does_not_reselect_test(testdir):
+    """A scratch file inside the project directory, never added to git -- the
+    shape of a temp probe, a log, or a generated cache entry a test
+    regenerates with new content on every run. `is_trackable_data_path` only
+    counts a data-file dependency when git tracks the file in the project's
+    rootdir, so an untracked scratch file must not reselect the test that
+    reads it on an otherwise unchanged second run. Measured 2026-10-31,
+    against the exophial test suite: with no git check, 861 of its tests
+    carried a dependency on files shaped like this one and reselected on
+    every run, changed or not.
+    """
+    testdir.makepyfile(
+        test_a="""
+        import pathlib
+
+        def test_reads_scratch_file():
+            pathlib.Path("scratch_probe.txt").read_text()
+        """
+    )
+    testdir.tmpdir.join("scratch_probe.txt").write("v1")
+    testdir.run("git", "init", "-q", "-b", "main")
+    testdir.run("git", "config", "user.email", "t@t")
+    testdir.run("git", "config", "user.name", "t")
+    testdir.run("git", "add", "test_a.py")
+    testdir.run("git", "commit", "-q", "-m", "seed")
+    testdir.runpytest_subprocess("--testmon")
+
+    # The scratch file was never committed. A real scratch file is rewritten
+    # with different content on every run with no project edit behind it;
+    # simulate that here.
+    testdir.tmpdir.join("scratch_probe.txt").write("v2, a different run, same test code")
+    with CoreTestmonData.for_local_run("") as td:
+        td.determine_stable()
+        assert "test_a.py::test_reads_scratch_file" not in td.unstable_test_names
+
+
+def test_subprocess_entirely_outside_rootdir_does_not_force_rerun(testdir):
+    """A child process whose cwd and every argument stay outside the project
+    directory cannot depend on project source. Unlike
+    test_untraceable_subprocess_always_reruns_test above (a child that
+    touches the project directory but names no file testmon can track), it
+    must not force a rerun on an otherwise unchanged run -- the shape of a
+    test fixture that clones a git template, or runs a pinned interpreter,
+    entirely under its own scratch directory outside the project.
+    """
+    testdir.makepyfile(
+        test_a="""
+        import subprocess, tempfile
+
+        def test_spawns_outside_project():
+            with tempfile.TemporaryDirectory() as outside:
+                subprocess.run(["true"], cwd=outside, check=True)
+
+        def test_plain():
+            assert 1 == 1
+        """
+    )
+    testdir.runpytest_subprocess("--testmon")
+
+    # Nothing on disk changed. The subprocess never touched the project
+    # directory, so it carries no possible project-source dependency.
+    with CoreTestmonData.for_local_run("") as td:
+        td.determine_stable()
+        assert "test_a.py::test_spawns_outside_project" not in td.unstable_test_names
+        assert "test_a.py::test_plain" not in td.unstable_test_names

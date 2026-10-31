@@ -30,6 +30,7 @@ from testmon.common import (
 
 from testmon.subprocess_support import (
     ALWAYS_RUN_SENTINEL,
+    get_git_tracked_files,
     install_sitecustomize,
     is_read_open,
     is_trackable_argv_path,
@@ -39,12 +40,14 @@ from testmon.subprocess_support import (
     project_relpath,
     read_sidecars,
     restore_pythonpath,
+    subprocess_child_touches_rootdir,
 )
 
 from testmon.process_code import (
     match_fingerprint,
     create_fingerprint,
     methods_to_checksums,
+    get_files_shas,
     get_source_sha,
     Module,
 )
@@ -546,6 +549,19 @@ class TestmonCollector:
         # started for that test, so `_merge_extra_dependencies` can tell whether
         # every child reported back.
         self._expected_python_children: dict = {}
+        # Resolve and cache the git-tracked-file set for `rootdir` now, before
+        # any test runs and the subprocess audit hook is live. `is_trackable_data_path`
+        # and `is_trackable_argv_path` call `get_git_tracked_files`, which shells
+        # out to `git ls-files`. A cache miss triggered mid-test would audit
+        # that very subprocess call as a child the running test spawned,
+        # falsely marking the test always-run. A cache hit, warmed here before
+        # `self._test_name` is ever set, never spawns the subprocess.
+        #
+        # `process_code.get_files_shas` shells out to `git ls-files --stage -m`
+        # for the same reason (a fast path for Python-file fshas); warm it here
+        # too, for the same reason.
+        get_git_tracked_files(self.rootdir)
+        get_files_shas(self.rootdir)
         TestmonCollector._ensure_audit_hook()
 
     @classmethod
@@ -572,7 +588,7 @@ class TestmonCollector:
         if os.path.isdir(abspath):
             return
         relpath = project_relpath(abspath, self.rootdir)
-        if relpath is None or not is_trackable_data_path(relpath):
+        if relpath is None or not is_trackable_data_path(relpath, self.rootdir):
             return
         self.file_deps.setdefault(self._test_name, set()).add(relpath)
 
@@ -582,9 +598,13 @@ class TestmonCollector:
         A Python child's dependencies arrive later, through its own coverage data
         file and sidecar report; see `_merge_extra_dependencies`. A non-Python
         child's command line is inspected directly: each argument naming an
-        existing project file becomes a dependency. A child that names no
-        project file, and a Python child whose report never arrives, mark the
-        test always-run.
+        existing, git-tracked project file becomes a dependency. A child whose
+        working directory and arguments carry no evidence of touching the
+        project directory (`subprocess_child_touches_rootdir`) cannot depend on
+        project source; testmon records no dependency for it rather than
+        marking its test always-run. A child that DOES touch the project, but
+        names no trackable file, and a Python child whose report never
+        arrives, mark the test always-run.
         """
         if self._test_name is None:
             return
@@ -595,10 +615,12 @@ class TestmonCollector:
             if isinstance(arg, (str, bytes, os.PathLike))
         ]
         argv0 = argv[0] if argv else None
+        touches_rootdir = subprocess_child_touches_rootdir(cwd, argv, self.rootdir)
         if looks_like_python_executable(executable, argv0):
-            self._expected_python_children[test_name] = (
-                self._expected_python_children.get(test_name, 0) + 1
-            )
+            if touches_rootdir:
+                self._expected_python_children[test_name] = (
+                    self._expected_python_children.get(test_name, 0) + 1
+                )
             return
         base_dir = cwd if isinstance(cwd, (str, bytes, os.PathLike)) else self.rootdir
         found_file = False
@@ -607,11 +629,11 @@ class TestmonCollector:
             if not os.path.isfile(candidate):
                 continue
             relpath = project_relpath(os.path.abspath(candidate), self.rootdir)
-            if relpath is None or not is_trackable_argv_path(relpath):
+            if relpath is None or not is_trackable_argv_path(relpath, self.rootdir):
                 continue
             self.file_deps.setdefault(test_name, set()).add(relpath)
             found_file = True
-        if not found_file:
+        if not found_file and touches_rootdir:
             self.always_run.add(test_name)
 
     def start_cov(self):
