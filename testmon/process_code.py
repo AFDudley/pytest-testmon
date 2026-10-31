@@ -34,7 +34,12 @@ def debug_blob_to_code(blob):
 def methods_to_checksums(blocks) -> [int]:
     checksums = []
     for block in blocks:
-        checksums.append(to_signed(zlib.crc32(block.encode("UTF-8"))))
+        # A Python block's code is always `str` (an ast.dump-style text
+        # representation). A non-Python file's single whole-file block (see
+        # `Module.blocks`) carries its content as raw `bytes`, never decoded, so
+        # it hashes the bytes directly instead of assuming text.
+        data = block.encode("UTF-8") if isinstance(block, str) else block
+        checksums.append(to_signed(zlib.crc32(data)))
 
     return checksums
 
@@ -85,7 +90,9 @@ class Block:
 
 
 @lru_cache(300)
-def bytes_to_string_and_fsha(byte_stream: bytes) -> Union[str, bytes]:
+def bytes_to_string_and_fsha(
+    byte_stream: bytes, is_python: bool = True
+) -> Union[str, bytes]:
     # The fsha must equal git's blob sha of the CRLF-normalized bytes, so that it
     # matches the index entry returned by get_files_shas() and no read is needed
     # for files git reports as unmodified. The header length is the byte length,
@@ -94,6 +101,13 @@ def bytes_to_string_and_fsha(byte_stream: bytes) -> Union[str, bytes]:
     hsh = hashlib.sha1()
     hsh.update(b"blob %u\0" % len(byte_stream))
     hsh.update(byte_stream)
+    if not is_python:
+        # A non-Python data file's fingerprint is a hash of its own bytes (see
+        # `methods_to_checksums`), never a decoded-text fingerprint. Decoding
+        # here would route through `source_encoding`, which calls
+        # `tokenize.detect_encoding` — built for Python source, so it raises on
+        # arbitrary binary content (e.g. a gzip file). Skip the decode entirely.
+        return byte_stream, hsh.hexdigest()
     # Replace \f because of http://bugs.python.org/issue19035
     byte_stream = byte_stream.replace(b"\f", b" ")
     byte_string = byte_stream.decode(source_encoding(byte_stream), "replace")
@@ -127,7 +141,9 @@ class Module:
         self.counter = 0
         self.mtime = mtime
         self._source_code = (
-            None if source_code is None else textwrap.dedent(source_code)
+            source_code
+            if source_code is None or isinstance(source_code, bytes)
+            else textwrap.dedent(source_code)
         )
         self.fs_fsha = (
             fs_fsha or bytes_to_string_and_fsha(bytes(source_code, "utf-8"))[1]
@@ -214,7 +230,9 @@ class Module:
     @property
     def source_code(self):
         if self._source_code is None:
-            self._source_code = read_source_sha(Path(self.rootdir) / self.filename)[0]
+            self._source_code = read_source_sha(
+                Path(self.rootdir) / self.filename, is_python=self.ext == "py"
+            )[0]
         return self._source_code
 
     @property
@@ -222,7 +240,7 @@ class Module:
         return methods_to_checksums([block.checksum for block in self.blocks])
 
 
-def read_source_sha(filename: str):
+def read_source_sha(filename: str, is_python: bool = True):
     source_bytes: Optional[bytes]
 
     try:
@@ -231,7 +249,7 @@ def read_source_sha(filename: str):
     except FileNotFoundError:
         return None, None
 
-    source, fsha = bytes_to_string_and_fsha(source_bytes)
+    source, fsha = bytes_to_string_and_fsha(source_bytes, is_python)
     return source, fsha
 
 
@@ -270,13 +288,13 @@ def get_files_shas(directory):
     return noncached_get_files_shas(directory)
 
 
-def get_source_sha(directory: "str", filename: "str"):
+def get_source_sha(directory: "str", filename: "str", is_python: bool = True):
     try:
         sha = get_files_shas(directory)[filename]
         return (None, sha)
     except KeyError:
         pass
-    return read_source_sha(Path(directory) / filename)
+    return read_source_sha(Path(directory) / filename, is_python)
 
 
 def match_fingerprint_source(source_code, fingerprint, ext="py"):

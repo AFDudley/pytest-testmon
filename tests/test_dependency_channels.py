@@ -10,6 +10,9 @@ See testmon/subprocess_support.py for the design. Each test covers one channel:
   child's command line (TestmonCollector.record_subprocess).
 - test_untraceable_subprocess_always_reruns_test: a child whose dependencies
   cannot be recorded (ALWAYS_RUN_SENTINEL).
+- test_binary_data_file_dependency_fingerprints_by_raw_bytes: a data file
+  with binary (non-UTF-8-decodable) content. testmon.process_code fingerprints
+  it from its raw bytes, never through tokenize/source_encoding.
 
 Every test runs `--testmon` once to build the dependency database, changes
 something on disk (or nothing, for the always-run case), then calls
@@ -119,3 +122,51 @@ def test_untraceable_subprocess_always_reruns_test(testdir):
         td.determine_stable()
         assert "test_a.py::test_untraceable" in td.unstable_test_names
         assert "test_a.py::test_plain" not in td.unstable_test_names
+
+
+def test_binary_data_file_dependency_fingerprints_by_raw_bytes(testdir):
+    """A gzip (binary) data file dependency never crashes testmon, and still
+    selects/deselects the test that reads it.
+
+    Measured 2026-10-31: a test that reads a non-Python file whose bytes are
+    not valid UTF-8 (e.g. a .gz archive) crashed every run with
+    `read_source_sha crashed ... SyntaxError('invalid or missing encoding
+    declaration')` then `UnicodeDecodeError`, because the fingerprint went
+    through `coverage.phystokens.source_encoding` -> `tokenize.detect_encoding`,
+    built for Python source. The fix fingerprints a non-Python file from its
+    raw bytes directly, skipping that decode.
+    """
+    import gzip
+
+    testdir.makepyfile(
+        test_a="""
+        import gzip
+
+        def test_reads_gzip():
+            with gzip.open("data.gz", "rb") as fh:
+                fh.read()
+        """
+    )
+    gz_path = str(testdir.tmpdir.join("data.gz"))
+    with gzip.open(gz_path, "wb") as fh:
+        fh.write(b"v1")
+
+    result = testdir.runpytest_subprocess("--testmon")
+    assert result.ret == 0, result.outlines
+    result.assert_outcomes(passed=1)
+
+    # Nothing on disk changed: the second run must not crash (the regression
+    # was an INTERNALERROR here), and the test must settle stable, the same
+    # check `test_data_file_dependency_selects_test` above uses.
+    result = testdir.runpytest_subprocess("--testmon")
+    assert result.ret == 0, result.outlines
+    with CoreTestmonData.for_local_run("") as td:
+        td.determine_stable()
+        assert "test_a.py::test_reads_gzip" not in td.unstable_test_names
+
+    # A change to the gzip bytes reselects the test.
+    with gzip.open(gz_path, "wb") as fh:
+        fh.write(b"v2")
+    with CoreTestmonData.for_local_run("") as td:
+        td.determine_stable()
+        assert "test_a.py::test_reads_gzip" in td.unstable_test_names

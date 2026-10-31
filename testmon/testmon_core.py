@@ -96,14 +96,25 @@ class SourceTree:
 
     def get_file(self, filename):
         if filename not in self.cache:
-            code, fsha = get_source_sha(directory=self.rootdir, filename=filename)
+            is_python = filename.endswith(".py")
+            code, fsha = get_source_sha(
+                directory=self.rootdir,
+                filename=filename,
+                is_python=is_python,
+            )
             if fsha:
                 try:
                     fs_mtime = os.path.getmtime(os.path.join(self.rootdir, filename))
                     self.cache[filename] = Module(
                         source_code=code,
                         mtime=fs_mtime,
-                        ext=filename.rsplit(".", 1)[1],
+                        # A data-file dependency (testmon.subprocess_support) can
+                        # name a file with no extension (e.g. "LICENSE"), unlike
+                        # the .py files this split previously always saw. "py"
+                        # vs. non-"py" is the only distinction `Module` makes, so
+                        # extensionless names fold into the non-"py" whole-file
+                        # block path instead of raising on the missing dot.
+                        ext="py" if is_python else filename.rsplit(".", 1)[-1],
                         fs_fsha=fsha,
                         filename=filename,
                         rootdir=self.rootdir,
