@@ -69,16 +69,34 @@ class TestConfigure:
             False,
         )
 
-    def test_nocollect_minus_k(self, options):
+    def test_nocollect_minus_k_keeps_selection_active(self, options):
+        # `--testmon-nocollect` stops recording new coverage; `-k` no longer
+        # deactivates selection (see `_get_noselect_reasons`), so an
+        # existing selection still runs.
         options["keyword"] = "test1"
         options["testmon_nocollect"] = True
         assert configure._header_collect_select(options) == TmConf(
-            (
-                "testmon: collection deactivated, "
-                "selection automatically deactivated because -k was used, "
-            ),
+            "testmon: collection deactivated, ",
             False,
-            False,
+            True,
+        )
+
+    def test_minus_k_alone_does_not_deactivate_selection(self, options):
+        options["testmon"] = True
+        options["keyword"] = "test1"
+        assert configure._header_collect_select(options) == TmConf(
+            "testmon: ",
+            True,
+            True,
+        )
+
+    def test_minus_m_alone_does_not_deactivate_selection(self, options):
+        options["testmon"] = True
+        options["markexpr"] = "not slow"
+        assert configure._header_collect_select(options) == TmConf(
+            "testmon: ",
+            True,
+            True,
         )
 
     def test_nocollect_coverage_without_cov_plugin(self, options):

@@ -59,7 +59,7 @@ def pytest_addoption(parser):
         dest="testmon_noselect",
         help=(
             "Reorder and prioritize the tests most likely to fail first, but don't deselect anything. "
-            "Forced if you use -m, -k, -l, -lf, test_file.py::test_name"
+            "Forced if you use -l, -lf, test_file.py::test_name"
         ),
     )
 
@@ -145,9 +145,31 @@ def testmon_options(config):
     return result
 
 
+def _environment_with_selection_scope(environment, markexpr, keyword):
+    """Fold `-m` and `-k` into the environment name testmon records under.
+
+    `configure._get_noselect_reasons` leaves selection active when `-m` or
+    `-k` is used; that is only safe because a run under one expression must
+    never read or write another expression's selection records. Appending
+    the expression to the environment name gives each distinct `-m`/`-k`
+    value its own `exec_id` row (`db.initiate_execution`), so a changed
+    expression starts from an empty record set instead of reusing a
+    different test selection.
+    """
+    scope_parts = [environment] if environment else []
+    if markexpr:
+        scope_parts.append(f"-m={markexpr}")
+    if keyword:
+        scope_parts.append(f"-k={keyword}")
+    return ";".join(scope_parts)
+
+
 def init_testmon_data(config: Config):
     environment = config.getoption("environment_expression") or eval_environment(
         config.getini("environment_expression")
+    )
+    environment = _environment_with_selection_scope(
+        environment, config.getoption("markexpr"), config.getoption("keyword")
     )
     ignore_dependencies = config.getini("testmon_ignore_dependencies")
 

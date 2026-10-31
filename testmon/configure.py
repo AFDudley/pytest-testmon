@@ -63,17 +63,16 @@ def _get_nocollect_reasons(
 
 
 def _get_noselect_reasons(options):
+    # `-m` and `-k` do NOT deactivate selection: `pytest_testmon.init_testmon_data`
+    # folds the mark expression and the keyword expression into the environment
+    # name, so a run under one expression never reuses another expression's
+    # selection records. See tests/test_configure.py and the `-m`/`-k` cases in
+    # tests/test_testmon.py::TestmonDeselect.
     if options["testmon_forceselect"]:
         return []
 
     if options["testmon_noselect"]:
         return [None]
-
-    if options["keyword"]:
-        return ["-k was used"]
-
-    if options["markexpr"]:
-        return ["-m was used"]
 
     # `--lf` is registered by the cacheprovider plugin, absent with `-p no:cacheprovider`
     if options.get("lf"):

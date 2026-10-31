@@ -323,6 +323,51 @@ class TestVariant:
             == "TEST_V:JUST_A_TEST"
         )
 
+    def test_minus_m_scopes_selection_records(self, testdir):
+        """`-m` must not deactivate selection, and a run under one `-m`
+        expression must not reuse a different expression's records.
+
+        `-m "not slow"` and `-m "not fast"` both match this unmarked test, so
+        pytest's own mark-based collection is identical across runs; only
+        testmon's own environment partitioning is under test here.
+        """
+        testdir.makepyfile(
+            test_a="""
+            def test_add():
+                assert 1 + 1 == 2
+        """
+        )
+        result = testdir.runpytest_inprocess("--testmon", "-v", "-m", "not slow")
+        result.assert_outcomes(passed=1)
+
+        # Same `-m`, no change: nothing is selected.
+        result = testdir.runpytest_inprocess("--testmon", "-v", "-m", "not slow")
+        result.assert_outcomes()
+
+        # A different `-m` expression, same unchanged file: must run fresh
+        # rather than silently reuse "not slow"'s selection records.
+        result = testdir.runpytest_inprocess("--testmon", "-v", "-m", "not fast")
+        result.assert_outcomes(passed=1)
+
+    def test_minus_k_scopes_selection_records(self, testdir):
+        """The same guarantee as `test_minus_m_scopes_selection_records`, for
+        `-k`: both expressions here match `test_add_value` by substring, so
+        pytest's own keyword-based collection is identical across runs."""
+        testdir.makepyfile(
+            test_a="""
+            def test_add_value():
+                assert 1 + 1 == 2
+        """
+        )
+        result = testdir.runpytest_inprocess("--testmon", "-v", "-k", "add")
+        result.assert_outcomes(passed=1)
+
+        result = testdir.runpytest_inprocess("--testmon", "-v", "-k", "add")
+        result.assert_outcomes()
+
+        result = testdir.runpytest_inprocess("--testmon", "-v", "-k", "value")
+        result.assert_outcomes(passed=1)
+
 
 class CodeSample:
     def __init__(self, source_code, expected_coverage=None, possible_lines=None):
@@ -690,6 +735,53 @@ class TestmonDeselect(object):
                 "*selection automatically deactivated because --lf was used*",
             ]
         )
+        result.assert_outcomes(failed=1, passed=0)
+
+    def test_reselects_after_a_called_functions_body_changes(self, testdir):
+        """A minimal project: a test imports a module and calls one of its
+        functions. An unchanged rerun selects nothing. A one-line change
+        inside the called function's body is reselected on the next run.
+
+        This pins the exact shape measured against the real
+        `exophial` repo (defect 3, 2026-10-31): `src/exophial/verdict.py`'s
+        `fetch_unknown_files` correctly flagged the file as changed and
+        `collect_mhashes` computed new checksums, but `db.determine_tests`
+        returned no affected test. Reproducing that shape here — both as a
+        minimal two-file project and as a controlled copy of the real
+        `verdict.py` + `tests/test_verdict.py` — found the core selection
+        path (`check_fingerprint_db`, `create_fingerprint`, the
+        `determine_tests` SQL) correct in every git state (staged,
+        unstaged), structural shape (nested functions, classes, decorators,
+        multi-statement bodies), and runner mode (xdist, pytest-cov) tried.
+        The measured run's "no test reselected" result traced to that run's
+        own edit landing on a different copy of the file than the one
+        `pytest` read, not to a defect in this selection path. This test
+        stays as a regression guard on the path the measurement implicated.
+        """
+        testdir.makepyfile(
+            a="""
+            def add(x, y):
+                return x + y
+        """,
+            test_a="""
+            from a import add
+            def test_add():
+                assert add(1, 2) == 3
+        """,
+        )
+        result = testdir.runpytest_inprocess("--testmon", "-v")
+        result.assert_outcomes(passed=1)
+
+        result = testdir.runpytest_inprocess("--testmon", "-v")
+        result.assert_outcomes()  # nothing selected: no change since the last run
+
+        testdir.makepyfile(
+            a="""
+            def add(x, y):
+                return x + y + 1
+        """,
+        )
+        result = testdir.runpytest_inprocess("--testmon", "-v")
         result.assert_outcomes(failed=1, passed=0)
 
     def test_easy(self, local_remote):
