@@ -27,6 +27,16 @@ something on disk (or nothing, for the always-run case), then calls
 the same pattern `tests/test_testmon.py` uses throughout.
 """
 
+import os
+import shutil
+import subprocess
+import sys
+from pathlib import Path
+
+import pytest
+
+from testmon.subprocess_support import read_sidecars, write_sidecar
+from testmon.testmon_core import TestmonCollector as CoreTestmonCollector
 from testmon.testmon_core import TestmonData as CoreTestmonData
 
 pytest_plugins = ("pytester",)
@@ -269,3 +279,138 @@ def test_subprocess_entirely_outside_rootdir_does_not_force_rerun(testdir):
         td.determine_stable()
         assert "test_a.py::test_spawns_outside_project" not in td.unstable_test_names
         assert "test_a.py::test_plain" not in td.unstable_test_names
+
+
+def test_python_subprocess_xdist_batch_race_does_not_reselect_test():
+    """Reproduces the xdist-batch-timing race from `acceptance-bfeb3e7.md`: every
+    xdist worker shared one `.tmontmp` directory. A worker's own batch flush
+    (`TestmonCollector._merge_extra_dependencies` -> `read_sidecars`) read and
+    deleted EVERY sidecar file present, not only the ones its own tests
+    expected. A worker that flushed first could read, and delete, a sidecar a
+    DIFFERENT worker's child already wrote, for a test that worker had not
+    flushed yet. The owning worker then never saw its own child's report and
+    marked the test always-run, even though the child reported cleanly and
+    nothing on disk changed.
+
+    Runs the generated project directly, not through the `testdir` fixture:
+    `testdir.tmpdir` sits under `TMPDIR`, and a tmpfs `TMPDIR` (a typical
+    `/tmp`) makes the sidecar directory's open/read/delete calls fast enough
+    that the race almost never shows up. Confirmed on this host: the same
+    project reselected 162-196 of 200 cases on this repo's disk-backed
+    `.scratch`, run back to back with a tmpfs `/tmp`, which reselected 0.
+    This also matches this repo's own rule that TMPDIR for a testmon
+    measurement never be `/tmp` -- see `CLAUDE.md`.
+
+    Needs real CPU contention to show up reliably too, not only xdist's own
+    task scheduling: children that only sleep (yielding the CPU) rarely hit
+    the race on this otherwise-idle host. Four worker processes per CPU
+    core, each test's child actively burning a core for 0.5s instead of
+    sleeping, recreates the contention the original acceptance measurement
+    saw ("observed ~1600% CPU with `-n auto`").
+
+    The defect itself is a real-time race (the acceptance report's own
+    words: a sidecar "sometimes is not read in time"), so this behavioral
+    reproduction stays probabilistic: on this host it selected 143-198 of
+    200 cases on most trials, and 0 on a few quiet ones, before the fix.
+    `test_xdist_workers_get_isolated_subprocess_sidecar_directories` below
+    proves the same defect and fix deterministically, by driving two
+    `TestmonCollector` instances directly instead of waiting on real
+    scheduling luck; it is the reliable gate for this change.
+    """
+    pytest.importorskip("xdist")
+    scratch_root = (
+        Path(__file__).resolve().parents[1] / ".scratch" / "xdist_race_probe"
+    )
+    project = scratch_root / "project"
+    shutil.rmtree(scratch_root, ignore_errors=True)
+    project.mkdir(parents=True)
+    try:
+        workers = str((os.cpu_count() or 4) * 4)
+        cases = "\n".join(f'    "case{i}",' for i in range(200))
+        (project / "test_a.py").write_text(
+            "import subprocess, sys\n"
+            "import pytest\n"
+            "\n"
+            '@pytest.mark.parametrize("case", [\n'
+            f"{cases}\n"
+            "])\n"
+            "def test_child_reads_project_file(case):\n"
+            "    busy = (\n"
+            '        "import time; t = time.time()\\n"\n'
+            '        "while time.time() - t < 0.5:\\n"\n'
+            '        "    pass\\n"\n'
+            "    )\n"
+            "    subprocess.run(\n"
+            "        [sys.executable, \"-c\", busy + \"open('shared_data.txt')"
+            '.read()"],\n'
+            "        check=True,\n"
+            "    )\n"
+        )
+        (project / "shared_data.txt").write_text("v1")
+        # Stops pytest's rootdir search here: with no config file of its own,
+        # it would walk up and find THIS repo's `tox.ini`, putting `.testmondata`
+        # at the worktree root instead of inside `project`.
+        (project / "pytest.ini").write_text("[pytest]\n")
+
+        def run(*args):
+            return subprocess.run(
+                [sys.executable, "-m", "pytest", "--testmon", "-n", workers, *args],
+                cwd=project,
+                capture_output=True,
+                text=True,
+                timeout=180,
+            )
+
+        record = run()
+        assert record.returncode == 0, record.stdout + record.stderr
+        assert "200 passed" in record.stdout, record.stdout
+
+        # Nothing on disk changed. Every one of the 200 cases must deselect;
+        # none may carry ALWAYS_RUN_SENTINEL from a sidecar a different
+        # worker's own flush consumed before the owning worker could read it.
+        check = run("-v")
+        assert check.returncode == 0, check.stdout + check.stderr
+        assert "no tests ran" in check.stdout, check.stdout
+    finally:
+        shutil.rmtree(scratch_root, ignore_errors=True)
+
+
+def test_xdist_workers_get_isolated_subprocess_sidecar_directories(tmp_path, monkeypatch):
+    """Deterministic version of the xdist-batch-timing race above: drives two
+    `TestmonCollector` instances directly, one per simulated xdist worker, instead
+    of waiting on real OS scheduling to interleave two real worker processes.
+
+    Before the fix, both collectors used the same plain `.tmontmp` directory
+    (`PYTEST_XDIST_WORKER` was never consulted), so "worker" gw1's flush
+    (`read_sidecars`) found and deleted gw0's sidecar, a report gw0 had not
+    flushed yet. gw0's own later flush then found nothing: the real defect
+    `test_python_subprocess_xdist_batch_race_does_not_reselect_test` above
+    reproduces behaviorally. After the fix, `setup_subprocess` scopes the
+    directory by `PYTEST_XDIST_WORKER`, so gw1's flush can never see gw0's
+    directory at all, regardless of timing.
+    """
+    rootdir = str(tmp_path)
+    includes = [os.path.join(rootdir, "*")]
+
+    monkeypatch.setenv("PYTEST_XDIST_WORKER", "gw0")
+    gw0 = CoreTestmonCollector(rootdir)
+    gw0.setup_subprocess(includes)
+    try:
+        write_sidecar(gw0.tmontmp_dir, "test_a.py::test_one", {"data.txt"})
+
+        # A different worker's own flush must never see gw0's report.
+        monkeypatch.setenv("PYTEST_XDIST_WORKER", "gw1")
+        gw1 = CoreTestmonCollector(rootdir)
+        gw1.setup_subprocess(includes)
+        try:
+            assert gw1.tmontmp_dir != gw0.tmontmp_dir
+            assert read_sidecars(gw1.tmontmp_dir) == []
+        finally:
+            gw1.close()
+
+        # gw0's own flush still finds its own report, untouched.
+        assert read_sidecars(gw0.tmontmp_dir) == [
+            ("test_a.py::test_one", ["data.txt"])
+        ]
+    finally:
+        gw0.close()

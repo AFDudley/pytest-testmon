@@ -144,6 +144,37 @@ def is_trackable_argv_path(relpath, rootdir):
     return relpath in tracked
 
 
+def worker_scoped_tmontmp_dir(rootdir):
+    """Absolute path to the current process's own `.tmontmp` scratch directory.
+
+    Every `TestmonCollector` in one xdist session shares a project `rootdir`,
+    but the sidecar directory must not be shared: `read_sidecars` deletes
+    every sidecar file it finds in the directory it is given, not only the
+    ones its own tests expect. Two xdist workers flushing at the same real
+    time race for the same sidecar files. Confirmed by direct
+    instrumentation (see `tests/test_dependency_channels.py::
+    test_python_subprocess_xdist_batch_race_does_not_reselect_test`): one
+    worker's flush reads, and deletes, a sidecar a DIFFERENT worker's child
+    wrote for a test that worker has not flushed yet. The true owner then
+    never sees its own child's report -- the file is already gone -- and
+    marks the test always-run, even though the child reported cleanly and
+    nothing on disk changed.
+
+    `PYTEST_XDIST_WORKER` names the current xdist worker (`gw0`, `gw1`, ...).
+    `xdist.remote` sets it in the worker process's own environment before
+    pytest even starts, so it is stable for the worker's whole session. A
+    `.tmontmp/<workerid>` subdirectory per worker gives every worker's
+    children and flushes an isolated directory: no two processes ever list,
+    read, or delete from the same path, so the race cannot happen -- by
+    construction, not by timing luck. A local (non-xdist) run has no
+    `PYTEST_XDIST_WORKER` and keeps the plain `.tmontmp` directory, same as
+    before this function existed.
+    """
+    worker_id = os.environ.get("PYTEST_XDIST_WORKER")
+    parts = (".tmontmp", worker_id) if worker_id else (".tmontmp",)
+    return os.path.abspath(os.path.join(rootdir, *parts))
+
+
 def project_relpath(abspath, rootdir):
     """Return `abspath` relative to `rootdir` with forward slashes, or None if outside it."""
     try:

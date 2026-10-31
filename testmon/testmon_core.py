@@ -41,6 +41,7 @@ from testmon.subprocess_support import (
     read_sidecars,
     restore_pythonpath,
     subprocess_child_touches_rootdir,
+    worker_scoped_tmontmp_dir,
 )
 
 from testmon.process_code import (
@@ -662,7 +663,8 @@ class TestmonCollector:
                 os.path.join(value, "*")
                 for key, value in sysconfig.get_paths().items()
                 if key.endswith("lib")
-            },
+            }
+            | {os.path.join(self.rootdir, ".tmontmp", "*")},
         }
         if self.cov_plugin and self.cov_plugin._started:
             cov = self.cov_plugin.cov_controller.cov
@@ -688,7 +690,7 @@ class TestmonCollector:
                     "branch coverage is on. Please disable branch coverage."
                 )
         if subprocess:
-            self.setup_subprocess(params["include"])
+            self.setup_subprocess(params["include"], params["omit"])
         self.cov = Coverage(data_file=self.sub_cov_file, config_file=False, **params)
         self.cov._warn_no_data = False
         force_context_capable_core(self.cov)
@@ -867,18 +869,34 @@ class TestmonCollector:
         if TestmonCollector.coverage_stack:
             TestmonCollector.coverage_stack[-1].start()
 
-    def setup_subprocess(self, includes):
+    def setup_subprocess(self, includes, omit=()):
         # Gives a Python child process testmon's own file-open tracking (through a
         # `sitecustomize.py` on its `PYTHONPATH`) and its executed-code coverage
         # (through coverage's own `COVERAGE_PROCESS_START` subprocess support,
         # pinned to the running test's name as a static context). See
         # `testmon.subprocess_support`.
-        self.tmontmp_dir = os.path.abspath(os.path.join(self.rootdir, ".tmontmp"))
+        #
+        # Worker-scoped, not a plain `.tmontmp`: see
+        # `subprocess_support.worker_scoped_tmontmp_dir` for why a directory
+        # shared across xdist workers is unsafe.
+        self.tmontmp_dir = worker_scoped_tmontmp_dir(self.rootdir)
         os.makedirs(self.tmontmp_dir, exist_ok=True)
         self.sub_cov_file = os.path.join(
             self.tmontmp_dir, ".testmoncoverage" + str(random.randint(0, 1000000))
         )
         self._subprocess_includes = includes
+        # Same `omit` set `setup_coverage` builds for the parent process
+        # (stdlib/site-packages, including a project-local venv's own --
+        # `sysconfig.get_paths()` reflects the RUNNING interpreter, which for
+        # a venv's python is the venv's own site-packages, not the system
+        # one), plus `.tmontmp` itself. Without this, a child that starts
+        # its own `COVERAGE_PROCESS_START` tracing imports `coverage`'s
+        # package to bootstrap, and that import's lines get recorded as a
+        # dependency of whatever test spawned the child. See
+        # `_write_subprocess_rc`.
+        self._subprocess_omit = set(omit) | {
+            os.path.join(self.rootdir, ".tmontmp", "*")
+        }
         self._write_subprocess_rc("")
         os.environ["COVERAGE_PROCESS_START"] = self.sub_cov_file + "_rc"
         os.environ["COVERAGE_CORE"] = COVERAGE_CORE
@@ -888,21 +906,36 @@ class TestmonCollector:
         self._prev_pythonpath = prepend_pythonpath(self.tmontmp_dir)
 
     def _write_subprocess_rc(self, context):
+        # `omit` keeps a Python child's own coverage config from tracing
+        # `coverage`'s own package (imported to bootstrap the child's
+        # tracing) or `sitecustomize.py` as "code the test executed". A
+        # worker-scoped `.tmontmp/<workerid>/sitecustomize.py` (see
+        # `subprocess_support.worker_scoped_tmontmp_dir`) tied to whichever
+        # xdist worker id happened to run this test, or a venv path neither
+        # `sysconfig` call omits for the right interpreter, becomes a
+        # recorded dependency on nothing the test's own source controls.
+        # Measured on the target suite, 2026-10-31: five test files,
+        # including `tests/test_statusline.py`, reselected on an unchanged
+        # second run only because `coverage`'s own package, or the worker id
+        # a child had run under, no longer matched between two runs.
         rc_content = textwrap.dedent(
             """\
                 [run]
                 data_file = {}
                 include = {}
+                omit = {}
                 parallel=True
                 context = {}
                 """
         ).format(
             self.sub_cov_file,
             "\n ".join(self._subprocess_includes),
+            "\n ".join(sorted(self._subprocess_omit)),
             context,
         )
         with open(self.sub_cov_file + "_rc", "w", encoding="utf-8") as subprocess_rc:
             subprocess_rc.write(rc_content)
+
 
 
 def _active_collector():
