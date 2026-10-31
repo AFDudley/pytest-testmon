@@ -48,6 +48,31 @@ def test_data_file_dependency_selects_test(testdir):
         assert "test_a.py::test_reads_data" not in td.unstable_test_names
 
 
+def test_tried_directory_open_is_not_tracked_as_a_data_file_dependency(testdir):
+    """`open(a_directory)` fires the same `sys.audit("open", ...)` event as a
+    normal file read, BEFORE Python's own `IsADirectoryError` check runs — so
+    code that tries to open a path and catches that error (instead of
+    checking `os.path.isdir` first) still leaves the attempt recorded. A
+    directory has no byte content to fingerprint; recording one crashed
+    `read_source_sha` with `IsADirectoryError` once that test's coverage was
+    saved and reported back to the xdist controller
+    (`TestmonCollector.record_opened_file`, `pytest_runtest_logreport`'s
+    worker branch)."""
+    testdir.makepyfile(
+        test_a="""
+        def test_tries_to_open_a_directory():
+            try:
+                open("a_directory")
+            except IsADirectoryError:
+                pass
+        """
+    )
+    testdir.mkdir("a_directory")
+    result = testdir.runpytest_subprocess("--testmon", "-n", "1")
+    assert "INTERNALERROR" not in result.stdout.str() + result.stderr.str()
+    result.assert_outcomes(passed=1)
+
+
 def test_python_subprocess_data_file_dependency(testdir):
     testdir.makepyfile(
         test_a="""

@@ -563,7 +563,15 @@ class TestmonCollector:
             return  # a bare file descriptor carries no filename
         if not is_read_open(mode, flags):
             return
-        relpath = project_relpath(os.path.abspath(os.fspath(path)), self.rootdir)
+        abspath = os.path.abspath(os.fspath(path))
+        # `sys.audit("open", ...)` also fires for a directory listing
+        # (`os.scandir`, `os.listdir`, `Path.iterdir`). A directory has no byte
+        # content to fingerprint, and recording one here crashes
+        # `read_source_sha` later with `IsADirectoryError` when `determine_stable`
+        # tries to open it as a file.
+        if os.path.isdir(abspath):
+            return
+        relpath = project_relpath(abspath, self.rootdir)
         if relpath is None or not is_trackable_data_path(relpath):
             return
         self.file_deps.setdefault(self._test_name, set()).add(relpath)
